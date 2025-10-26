@@ -1,7 +1,5 @@
 // Basially F#+ but worse. Also inspired by cannorin's prelude. Very impure,
 // and in practice used to write the moral equivalent of bad GC'd Rust
-// fsharplint:disable TypeNames
-// fsharplint:disable GenericTypesNames
 module Pervs
 
 type u8    = uint8
@@ -17,18 +15,19 @@ type isize = nativeint
 type f32   = single
 type f64   = double
 
+type VOption<'a>                        = ValueOption<'a>
 #if !FABLE_COMPILER
-type Vec<'a>         = System.Collections.Immutable.ImmutableList<'a>
+type Vec<'a>                            = System.Collections.Immutable.ImmutableList<'a>
 #endif
-type Seq<'a>         = seq<'a>
-type MVec<'a>        = ResizeArray<'a>
+type Seq<'a>                            = seq<'a>
+type MVec<'a>                           = ResizeArray<'a>
 #if !FABLE_COMPILER
-type Span<'a>        = System.ReadOnlySpan<'a>
-type MSpan<'a>       = System.Span<'a>
+type Span<'a>                           = System.ReadOnlySpan<'a>
+type MSpan<'a>                          = System.Span<'a>
 #endif
-type HashSet<'k>     = System.Collections.Generic.HashSet<'k>
-type HashMap<'k, 'v> = System.Collections.Generic.Dictionary<'k, 'v>
-type String          = System.String
+type HashSet<'k>                        = System.Collections.Generic.HashSet<'k>
+type HashMap<'k, 'v when 'k : not null> = System.Collections.Generic.Dictionary<'k, 'v>
+type String                             = string
 
 module Lazy =
    let inline force (x : Lazy<_>) = x.Force ()
@@ -77,15 +76,8 @@ module Async =
 module Option =
    let inline wrap x = Some x
 
-   let inline ofValueOption x =
-      match x with
-      | ValueSome a -> Some a
-      | ValueNone   -> None
-
-   let inline toValueOption x =
-      match x with
-      | Some a -> ValueSome a
-      | None   -> ValueNone
+   let ofVOption = Option.ofValueOption
+   let toVOption = Option.toValueOption
 
    let inline ofChoice x =
       match x with
@@ -137,10 +129,9 @@ module Option =
       | Some f, Some a -> Some <| f a
       | _              -> None
 
-module ValueOption =
-   let ofOption = Option.toValueOption
-   let toOption = Option.ofValueOption
+module VOption = ValueOption
 
+module VOption =
    let inline ofChoice x =
       match x with
       | Choice1Of2 a -> ValueSome a
@@ -194,10 +185,10 @@ module ValueOption =
 #endif
 
 module Choice =
-   let ofOption      = Option.toChoice
-   let toOption      = Option.ofChoice
-   let ofValueOption = ValueOption.toChoice
-   let toValueOption = ValueOption.ofChoice
+   let ofOption  = Option.toChoice
+   let toOption  = Option.ofChoice
+   let ofVOption = VOption.toChoice
+   let toVOption = VOption.ofChoice
 
    let inline ofResult x =
       match x with
@@ -285,17 +276,12 @@ module Choice =
       | Choice2Of2 _ -> acc
 
 module Result =
-   let ofOption      = Option.toResult
-   let toOption      = Option.ofResult
-   let ofValueOption = ValueOption.toResult
-   let toValueOption = ValueOption.ofResult
-   let ofChoice      = Choice.toResult
-   let toChoice      = Choice.ofResult
-
-   let inline defaultValue e x =
-      match x with
-      | Ok a    -> a
-      | Error _ -> e
+   let ofOption  = Option.toResult
+   let toOption  = Option.ofResult
+   let ofVOption = VOption.toResult
+   let toVOption = VOption.ofResult
+   let ofChoice  = Choice.toResult
+   let toChoice  = Choice.ofResult
 
    let inline defaultWith ([<InlineIfLambda>] f) x =
       match x with
@@ -400,8 +386,17 @@ type System.ReadOnlySpan<'a> with
       | Some off, Some end' -> this.Slice (off, end' - off + 1)
 
 module Span =
-   let inline ofArray (xs : _[])     = Span xs
-   let inline toArray (xs : Span<_>) = xs.ToArray ()
+   let inline ofArray (xs : _[])      = Span xs
+   let inline toArray (xs : Span<_>)  = xs.ToArray ()
+   let inline ofMSpan (xs : MSpan<_>) = MSpan.op_Implicit xs
+
+   let inline ofMVec xs =
+      MSpan.op_Implicit (System.Runtime.InteropServices.CollectionsMarshal.AsSpan xs)
+
+   let toMVec (xs : Span<_>) =
+      let ys = MVec ()
+      System.Collections.Generic.CollectionExtensions.AddRange (ys, xs)
+      ys
 
    let inline length (xs : Span<_>) = xs.Length
    let inline isEmpty xs            = length xs = 0
@@ -468,6 +463,9 @@ type System.Span<'a> with
 module MSpan =
    let inline ofArray (xs : _[])      = MSpan xs
    let inline toArray (xs : MSpan<_>) = xs.ToArray ()
+   let inline toSpan xs               = Span.ofMSpan xs
+   let        ofMVec                  = System.Runtime.InteropServices.CollectionsMarshal.AsSpan
+   let        toMVec xs               = Span.toMVec (MSpan.op_Implicit xs)
 
    let inline length (xs : MSpan<_>) = xs.Length
    let inline isEmpty xs             = length xs = 0
@@ -594,12 +592,18 @@ module MVec =
       xs.Add x
       xs
 
-   let ofSeq (xs : Seq<_>)    = MVec xs
-   let toSeq (xs : MVec<_>)   = xs :> Seq<_>
-   let ofList (xs : List<_>)  = MVec xs
-   let toList  (xs : MVec<_>) = Seq.toList xs
-   let ofArray (xs : _[])     = MVec xs
-   let toArray (xs : MVec<_>) = xs.ToArray ()
+   let inline ofSeq (xs : Seq<_>)    = MVec xs
+   let inline toSeq (xs : MVec<_>)   = xs :> Seq<_>
+   let inline ofList (xs : List<_>)  = MVec xs
+   let inline toList  (xs : MVec<_>) = Seq.toList xs
+   let inline ofArray (xs : _[])     = MVec xs
+   let inline toArray (xs : MVec<_>) = xs.ToArray ()
+#if !FABLE_COMPILER
+   let inline ofSpan xs              = Span.toMVec xs
+   let inline toSpan xs              = Span.ofMVec xs
+   let inline ofMSpan xs             = MSpan.toMVec xs
+   let inline toMSpan xs             = MSpan.ofMVec xs
+#endif
 
    let inline length (xs : MVec<_>)  = xs.Count
    let inline isEmpty (xs : MVec<_>) = length xs = 0
@@ -697,11 +701,13 @@ module Map =
    let inline tryLast xs = if Map.isEmpty xs then None else Some <| last xs
 
 module String =
-   let inline ofArray (cs : char[]) = String cs
-   let inline toArray (s : String)  = s.ToCharArray ()
-
-   let inline toOption s           = if String.IsNullOrEmpty s then None else Some s
-   let inline toOptionWhiteSpace s = if String.IsNullOrWhiteSpace s then None else Some s
+   let inline ofArray (cs : char[])     = String cs
+   let inline toArray (s : String)      = s.ToCharArray ()
+#if !FABLE_COMPILER
+   let inline ofSpan (s : Span<char>)   = s.ToString ()
+   let inline ofMSpan (s : MSpan<char>) = s.ToString ()
+   let inline toSpan s                  = System.MemoryExtensions.AsSpan s
+#endif
 
    let inline isEmpty s            = String.length s = 0
    let inline item i (s : String)  = s.[i]
@@ -718,16 +724,18 @@ module String =
    let inline append (s : String) t         = s + t
    let inline split (c : char) (s : String) = s.Split (c, System.StringSplitOptions.None)
 
-type System.String with
-   member inline this.TryIndexOf (c : char) =
-      match this.IndexOf c with
-      | -1 -> None
-      | i  -> Some i
-
 #nowarn 64
 module Typeclasses =
+   [<AbstractClass>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Instance = class end
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Thunk =
       static member inline Force ([<InlineIfLambda>] f) = f ()
       static member inline Force x                      = Lazy.force x
@@ -741,6 +749,10 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Force : _ -> _) x)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Tuple =
       static member inline Tup (a, b, _ : (_ * _))                 = (a, b)
       static member inline Tup (a, b, _ : (struct(_ * _)))         = struct(a, b)
@@ -791,18 +803,22 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Trd : _ -> _) x)
          call Unchecked.defaultof<Tuple>
 
-   type Monoid =
-      static member inline Zero (_ : Async<_>)       = Async.never ()
-      static member inline Zero (_ : Option<_>)      = None
-      static member inline Zero (_ : ValueOption<_>) = ValueNone
-      static member inline Zero (_ : Seq<_>)         = Seq.empty
-      static member inline Zero (_ : List<_>)        = []
-      static member inline Zero (_ : _[])            = [||]
-#if !FABLE_COMPILER
-      static member inline Zero (_ : Vec<_>)         = Vec.empty
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
 #endif
-      static member inline Zero (_ : MVec<_>)        = MVec.empty
-      static member inline Zero (_ : String)         = ""
+   type Monoid =
+      static member inline Zero (_ : Async<_>)   = Async.never ()
+      static member inline Zero (_ : Option<_>)  = None
+      static member inline Zero (_ : VOption<_>) = ValueNone
+      static member inline Zero (_ : Seq<_>)     = Seq.empty
+      static member inline Zero (_ : List<_>)    = []
+      static member inline Zero (_ : _[])        = [||]
+#if !FABLE_COMPILER
+      static member inline Zero (_ : Vec<_>)     = Vec.empty
+#endif
+      static member inline Zero (_ : MVec<_>)    = MVec.empty
+      static member inline Zero (_ : String)     = ""
 
       static member inline Zero (()) = () // Another weird srtp workaround
 
@@ -816,7 +832,7 @@ module Typeclasses =
 #endif
       static member Combine (x, y)   = Option.alt x y
 #if !FABLE_COMPILER
-      static member Combine (x, y)   = ValueOption.alt x y
+      static member Combine (x, y)   = VOption.alt x y
 #endif
       static member Combine (xs, ys) = Seq.append xs ys
       static member Combine (xs, ys) = List.append xs ys
@@ -833,6 +849,10 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Combine : _ * _ -> _) x, y)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Functor =
       static member inline Map ([<InlineIfLambda>] f, (a, b)) = (f a, b)
       static member inline Map ([<InlineIfLambda>] f, g)      = g >> f
@@ -840,7 +860,7 @@ module Typeclasses =
       static member inline Map ([<InlineIfLambda>] f, x)      = Async.map f x
       static member inline Map ([<InlineIfLambda>] f, x)      = Option.map f x
 #if !FABLE_COMPILER
-      static member inline Map ([<InlineIfLambda>] f, x)      = ValueOption.map f x
+      static member inline Map ([<InlineIfLambda>] f, x)      = VOption.map f x
 #endif
       static member inline Map ([<InlineIfLambda>] f, x)      = Choice.map f x
       static member inline Map ([<InlineIfLambda>] f, x)      = Result.map f x
@@ -871,7 +891,7 @@ module Typeclasses =
       static member inline Iter ([<InlineIfLambda>] f, x)             = x |> Lazy.force |> f
       static member inline Iter ([<InlineIfLambda>] f, x)             = Option.iter f x
 #if !FABLE_COMPILER
-      static member inline Iter ([<InlineIfLambda>] f, x)             = ValueOption.iter f x
+      static member inline Iter ([<InlineIfLambda>] f, x)             = VOption.iter f x
 #endif
       static member inline Iter ([<InlineIfLambda>] f, x)             = Choice.iter f x
       static member inline Iter ([<InlineIfLambda>] f, x)             = Result.iter f x
@@ -899,6 +919,10 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Iter : _ * _ -> _) f, x)
          call Unchecked.defaultof<Functor>
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Zipable =
       inherit Instance
 
@@ -906,7 +930,7 @@ module Typeclasses =
       static member inline Zip (x, y)   = Async.zip x y
       static member inline Zip (x, y)   = Option.zip x y
 #if !FABLE_COMPILER
-      static member inline Zip (x, y)   = ValueOption.zip x y
+      static member inline Zip (x, y)   = VOption.zip x y
 #endif
       static member inline Zip (x, y)   = Choice.zip x y
       static member inline Zip (x, y)   = Result.zip x y
@@ -920,7 +944,7 @@ module Typeclasses =
 
       static member inline Unzip (x, _ : Zipable)  = Option.unzip x
 #if !FABLE_COMPILER
-      static member inline Unzip (x, _ : Zipable)  = ValueOption.unzip x
+      static member inline Unzip (x, _ : Zipable)  = VOption.unzip x
 #endif
       static member inline Unzip (x, _ : Zipable)  = Choice.unzip x
       static member inline Unzip (x, _ : Zipable)  = Result.unzip x
@@ -937,18 +961,22 @@ module Typeclasses =
          let inline call (w : ^w) = ((^a or ^w) : (static member Unzip : _ * _ -> _) x, w)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Applicative =
       inherit Instance
 
-      static member inline Wrap (x, _ : Lazy<_>)        = lazy x
-      static member inline Wrap (x, _ : Async<_>)       = Async.ofValue x
-      static member inline Wrap (x, _ : Option<_>)      = Some x
-      static member inline Wrap (x, _ : ValueOption<_>) = ValueSome x
-      static member inline Wrap (x, _ : Choice<_, _>)   = Choice1Of2 x
-      static member inline Wrap (x, _ : Result<_, _>)   = Ok x
-      static member inline Wrap (x, _ : Seq<_>)         = Seq.singleton x
-      static member inline Wrap (x, _ : List<_>)        = [x]
-      static member inline Wrap (x, _ : _[])            = [|x|]
+      static member inline Wrap (x, _ : Lazy<_>)      = lazy x
+      static member inline Wrap (x, _ : Async<_>)     = Async.ofValue x
+      static member inline Wrap (x, _ : Option<_>)    = Some x
+      static member inline Wrap (x, _ : VOption<_>)   = ValueSome x
+      static member inline Wrap (x, _ : Choice<_, _>) = Choice1Of2 x
+      static member inline Wrap (x, _ : Result<_, _>) = Ok x
+      static member inline Wrap (x, _ : Seq<_>)       = Seq.singleton x
+      static member inline Wrap (x, _ : List<_>)      = [x]
+      static member inline Wrap (x, _ : _[])          = [|x|]
 #if !FABLE_COMPILER
       static member inline Wrap (x, _ : Vec<_>)         = Vec.singleton x
 #endif
@@ -963,7 +991,7 @@ module Typeclasses =
       static member inline Apply (f, x)   = Async.apply f x
       static member inline Apply (f, x)   = Option.apply f x
 #if !FABLE_COMPILER
-      static member inline Apply (f, x)   = ValueOption.apply f x
+      static member inline Apply (f, x)   = VOption.apply f x
 #endif
       static member inline Apply (f, x)   = Choice.apply f x
       static member inline Apply (f, x)   = Result.apply f x
@@ -977,7 +1005,7 @@ module Typeclasses =
 
       static member inline Lift2 (f, x, y, _ : Applicative) = Option.map2 f x y
 #if !FABLE_COMPILER
-      static member inline Lift2 (f, x, y, _ : Applicative) = ValueOption.map2 f x y
+      static member inline Lift2 (f, x, y, _ : Applicative) = VOption.map2 f x y
 #endif
 
       static member inline Lift2 (f, x, y, _ : Instance) =
@@ -988,12 +1016,16 @@ module Typeclasses =
             ((^a or ^w) : (static member Lift2 : _ * _ * _ * _ -> _) f, x, y, w)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Monad =
       static member inline Join x              = Lazy.flatten x
       static member inline Join x              = Async.flatten x
       static member inline Join x              = Option.flatten x
 #if !FABLE_COMPILER
-      static member inline Join x              = ValueOption.flatten x
+      static member inline Join x              = VOption.flatten x
 #endif
       static member inline Join x              = Choice.flatten x
       static member inline Join x              = Result.flatten x
@@ -1009,7 +1041,7 @@ module Typeclasses =
       static member inline Bind ([<InlineIfLambda>] f, x)  = Async.bind f x
       static member inline Bind ([<InlineIfLambda>] f, x)  = Option.bind f x
 #if !FABLE_COMPILER
-      static member inline Bind ([<InlineIfLambda>] f, x)  = ValueOption.bind f x
+      static member inline Bind ([<InlineIfLambda>] f, x)  = VOption.bind f x
 #endif
       static member inline Bind ([<InlineIfLambda>] f, x)  = Choice.bind f x
       static member inline Bind ([<InlineIfLambda>] f, x)  = Result.bind f x
@@ -1024,6 +1056,10 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Bind : _ * _ -> _) f, x)
          call Unchecked.defaultof<Monad>
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Bifunctor =
       static member inline MapSnd ([<InlineIfLambda>] f, (a, b)) = (a, f b)
       static member inline MapSnd ([<InlineIfLambda>] f, x)      = Choice.map2Of2 f x
@@ -1054,6 +1090,10 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Bimap : _ * _ * _ -> _) f, g, x)
          call Unchecked.defaultof<Bifunctor>
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type BindSnd =
       static member inline BindSnd ([<InlineIfLambda>] f, x) = Choice.bind2Of2 f x
       static member inline BindSnd ([<InlineIfLambda>] f, x) = Result.bindError f x
@@ -1062,6 +1102,10 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member BindSnd : _ * _ -> _) f, x)
          call Unchecked.defaultof<BindSnd>
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Validation =
       static member inline Zipv (x, y) =
          match x, y with
@@ -1097,10 +1141,14 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^f or ^w) : (static member Applyv : _ * _ -> _) f, x)
          call Unchecked.defaultof<Validation>
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type ValueOr =
       static member inline ValueOr (v, x) = Option.defaultValue v x
 #if !FABLE_COMPILER
-      static member inline ValueOr (v, x) = ValueOption.defaultValue v x
+      static member inline ValueOr (v, x) = VOption.defaultValue v x
 #endif
       static member inline ValueOr (v, x) = Choice.defaultValue v x
       static member inline ValueOr (v, x) = Result.defaultValue v x
@@ -1111,7 +1159,7 @@ module Typeclasses =
 
       static member inline ValueOrElse ([<InlineIfLambda>] f, x) = Option.defaultWith f x
 #if !FABLE_COMPILER
-      static member inline ValueOrElse ([<InlineIfLambda>] f, x) = ValueOption.defaultWith f x
+      static member inline ValueOrElse ([<InlineIfLambda>] f, x) = VOption.defaultWith f x
 #endif
       static member inline ValueOrElse ([<InlineIfLambda>] f, x) = Choice.defaultWith f x
       static member inline ValueOrElse ([<InlineIfLambda>] f, x) = Result.defaultWith f x
@@ -1140,6 +1188,10 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member ValueOrElse : _ * _ -> _) a, x)
          call Unchecked.defaultof<ValueOr>
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type OrError =
       static member inline OrError (e : 'e when 'e : struct, x) =
          match x with
@@ -1162,7 +1214,7 @@ module Typeclasses =
          | Error _ -> Error e
 
       static member inline OrError ((), x) = Result.ofOption x
-      static member inline OrError ((), x) = Result.ofValueOption x
+      static member inline OrError ((), x) = Result.ofVOption x
       static member inline OrError ((), x) = x |> Result.ofChoice |> Result.mapError ignore
       static member inline OrError ((), x) = x |> Result.mapError ignore
 
@@ -1214,10 +1266,14 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member OrElseError : _ * _ -> _) e, x)
          call Unchecked.defaultof<OrError>
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Filter =
       static member inline Filter ([<InlineIfLambda>] f, x)  = Option.filter f x
 #if !FABLE_COMPILER
-      static member inline Filter ([<InlineIfLambda>] f, x)  = ValueOption.filter f x
+      static member inline Filter ([<InlineIfLambda>] f, x)  = VOption.filter f x
 #endif
       static member inline Filter ([<InlineIfLambda>] f, xs) = Seq.filter f xs
       static member inline Filter ([<InlineIfLambda>] f, xs) = List.filter f xs
@@ -1235,12 +1291,16 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Filter : _ * _ -> _) f, x)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Foldable =
       inherit Instance
 
       static member inline Fold (([<InlineIfLambda>] f), acc, x) = Option.fold f acc x
 #if !FABLE_COMPILER
-      static member inline Fold (([<InlineIfLambda>] f), acc, x) = ValueOption.fold f acc x
+      static member inline Fold (([<InlineIfLambda>] f), acc, x) = VOption.fold f acc x
 #endif
       static member inline Fold (([<InlineIfLambda>] f), acc, x) = Choice.fold f acc x
       static member inline Fold (([<InlineIfLambda>] f), acc, x) = Result.fold f acc x
@@ -1336,6 +1396,10 @@ module Typeclasses =
             ((^b or ^w) : (static member FoldBackWhile : _ * _ * _ * _ -> _) f, x, acc, w)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Length =
       inherit Instance
 
@@ -1356,6 +1420,10 @@ module Typeclasses =
          let inline call (w : ^w) = ((^a or ^w) : (static member Length : _ * Instance -> _) x, w)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Item =
       inherit Instance
 
@@ -1396,6 +1464,10 @@ module Typeclasses =
             ((^a or ^w) : (static member TryItem : _ * _ * Instance -> _) a, x, w)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Head =
       inherit Instance
 
@@ -1442,6 +1514,10 @@ module Typeclasses =
          let inline call (w : ^w) = ((^a or ^w) : (static member TryHead : _ * Instance -> _) x, w)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Tail =
       inherit Instance
 
@@ -1458,6 +1534,10 @@ module Typeclasses =
          let inline call (w : ^w) = ((^a or ^w) : (static member Tail : _ * Instance -> _) x, w)
          call
 
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Traversable =
       inherit Instance
 
@@ -1546,10 +1626,7 @@ module Builders =
       member inline _.TryFinally ([<InlineIfLambda>] f, g)     = try f () finally g ()
 
       member inline this.Using (d : #System.IDisposable, [<InlineIfLambda>] f) =
-         this.TryFinally ((fun _ -> f d), fun _ ->
-            match d with
-            | null -> ()
-            | _    -> d.Dispose ())
+         this.TryFinally ((fun _ -> f d), fun _ -> d.Dispose ())
 
    type Monad () =
       inherit Applicative ()
@@ -1590,6 +1667,14 @@ module Operators =
    let inline f32   x = single x
    let inline f64   x = double x
 
+   let VSome = ValueSome
+   let VNone = ValueNone
+
+   let inline (|VSome|VNone|) (x : VOption<'a>) =
+      match x with
+      | ValueSome a -> VSome a
+      | ValueNone   -> VNone
+
    let inline (=^) l r  = NonStructuralComparison.(=) l r
    let inline (<>^) l r = NonStructuralComparison.(<>) l r
    let inline (<^) l r  = NonStructuralComparison.(<) l r
@@ -1611,7 +1696,8 @@ module Operators =
    let inline flip f x y = f y x
    let inline tap f x    = f x; x
 
-   let inline (!!) (x : ^a) = (^a : (member Value : _) x)
+   let inline (~%) (x : ^a) : ^b = ((^a or ^b) : (static member op_Implicit : ^a -> ^b) x)
+   let inline (!!) (x : ^a)       = (^a : (member Value : _) x)
 
    let inline force x = Thunk.Invoke x Unchecked.defaultof<Thunk>
 
