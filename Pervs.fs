@@ -66,7 +66,7 @@ module Async =
    let inline alt x y = [|map Some x; map Some y|] |> Async.Choice |> map Option.get
 #endif
 
-   let inline zip (x : Async<'a>) (y : Async<'b>) : Async<'a * 'b>=
+   let inline zip (x : Async<'a>) (y : Async<'b>) : Async<'a * 'b> =
       [|map box x; map box y|] |> Async.Parallel |> map (fun xy -> unbox xy.[0], unbox xy.[1])
 
    let inline apply f x                     = zip f x |> map (fun (g, a) -> g a)
@@ -743,10 +743,10 @@ module Typeclasses =
       static member inline Force x                      = Async.wait x
 #endif
 
-      // There's a weird srtp bug that goes away if the `lazy` overload is
-      // removed. Making the caller provide the witnesses works around it
       static member inline Invoke (x : ^a) =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Force : _ -> _) x)
+         // There's a weird SRTP bug that goes away if we provide the witness
+         // in the caller rather than here
          call
 
    [<AbstractClass; Sealed>]
@@ -761,13 +761,13 @@ module Typeclasses =
 
       static member inline InvokeTup a b : ^a =
          let inline call (_ : ^w) =
-            ((^a or ^w) : (static member Tup : _ * _ * _ -> _) a, b, Unchecked.defaultof<'a>)
+            ((^a or ^w) : (static member Tup : _ * _ * _ -> _) a, b, Unchecked.defaultof<^a>)
          call Unchecked.defaultof<Tuple>
 
       static member inline InvokeTup3 a b c : ^a =
          let inline call (_ : ^w) =
             ((^a or ^w) :
-               (static member Tup3 : _ * _ * _ * _ -> _) a, b, c, Unchecked.defaultof<'a>)
+               (static member Tup3 : _ * _ * _ * _ -> _) a, b, c, Unchecked.defaultof<^a>)
          call Unchecked.defaultof<Tuple>
 
       static member inline Fst ((a, _))        = a
@@ -820,11 +820,11 @@ module Typeclasses =
       static member inline Zero (_ : MVec<_>)    = MVec.empty
       static member inline Zero (_ : String)     = ""
 
-      static member inline Zero (()) = () // Another weird srtp workaround
+      static member inline Zero (()) = () // Another weird SRTP workaround
 
       static member inline InvokeZero () : (_ -> ^a) =
          let inline call (_ : ^w) =
-            ((^a or ^w) : (static member Zero : _ -> _) Unchecked.defaultof<'a>)
+            ((^a or ^w) : (static member Zero : _ -> _) Unchecked.defaultof<^a>)
          call
 
 #if !FABLE_COMPILER
@@ -940,7 +940,7 @@ module Typeclasses =
 
       static member inline InvokeZip (x : ^a) (y : ^a) =
          let inline call (_ : ^w) = ((^a or ^w) : (static member Zip : _ * _ -> _) x, y)
-         call
+         call Unchecked.defaultof<Zipable>
 
       static member inline Unzip (x, _ : Zipable)  = Option.unzip x
 #if !FABLE_COMPILER
@@ -984,7 +984,7 @@ module Typeclasses =
 
       static member inline InvokeWrap x : ^a =
          let inline call (_ : ^w) =
-            ((^a or ^w) : (static member Wrap : _ * _ -> _) x, Unchecked.defaultof<'a>)
+            ((^a or ^w) : (static member Wrap : _ * _ -> _) x, Unchecked.defaultof<^a>)
          call Unchecked.defaultof<Applicative>
 
       static member inline Apply (f, x)   = Lazy.apply f x
@@ -1003,15 +1003,17 @@ module Typeclasses =
          let inline call (_ : ^w) = ((^f or ^w) : (static member Apply : _ * _ -> _) f, x)
          call Unchecked.defaultof<Applicative>
 
-      static member inline Lift2 (f, x, y, _ : Applicative) = Option.map2 f x y
+      static member inline Lift2 (([<InlineIfLambda>] f), x, y, _ : Applicative) =
+         Option.map2 f x y
 #if !FABLE_COMPILER
-      static member inline Lift2 (f, x, y, _ : Applicative) = VOption.map2 f x y
+      static member inline Lift2 (([<InlineIfLambda>] f), x, y, _ : Applicative) =
+         VOption.map2 f x y
 #endif
 
       static member inline Lift2 (f, x, y, _ : Instance) =
          Applicative.InvokeApply <| Functor.InvokeMap f x <| y
 
-      static member inline InvokeLift2 (f : _ -> _ -> _) (x : ^a) y =
+      static member inline InvokeLift2 ([<InlineIfLambda>] f : _ -> _ -> _) (x : ^a) y =
          let inline call (w : ^w) =
             ((^a or ^w) : (static member Lift2 : _ * _ * _ * _ -> _) f, x, y, w)
          call
@@ -1065,7 +1067,7 @@ module Typeclasses =
       static member inline MapSnd ([<InlineIfLambda>] f, x)      = Choice.map2Of2 f x
       static member inline MapSnd ([<InlineIfLambda>] f, x)      = Result.mapError f x
 
-      static member inline InvokeMapSnd ([<InlineIfLambda>]f : _ -> _) (x : ^a) =
+      static member inline InvokeMapSnd ([<InlineIfLambda>] f : _ -> _) (x : ^a) =
          let inline call (_ : ^w) = ((^a or ^w) : (static member MapSnd : _ * _ -> _) f, x)
          call Unchecked.defaultof<Bifunctor>
 
@@ -1073,7 +1075,7 @@ module Typeclasses =
       static member inline IterSnd ([<InlineIfLambda>] f, x)             = Choice.iter2Of2 f x
       static member inline IterSnd ([<InlineIfLambda>] f, x)             = Result.iterError f x
 
-      static member inline InvokeIterSnd ([<InlineIfLambda>]f : _ -> _) (x : ^a) =
+      static member inline InvokeIterSnd ([<InlineIfLambda>] f : _ -> _) (x : ^a) =
          let inline call (_ : ^w) = ((^a or ^w) : (static member IterSnd : _ * _ -> _) f, x)
          call Unchecked.defaultof<Bifunctor>
 
@@ -1086,9 +1088,10 @@ module Typeclasses =
          Result.bimap f g x
 
       static member inline InvokeBimap
-       ([<InlineIfLambda>]f : _ -> _) ([<InlineIfLambda>]g : _ -> _) (x : ^a) =
-         let inline call (_ : ^w) = ((^a or ^w) : (static member Bimap : _ * _ * _ -> _) f, g, x)
-         call Unchecked.defaultof<Bifunctor>
+         ([<InlineIfLambda>] f : _ -> _) ([<InlineIfLambda>] g : _ -> _) (x : ^a) =
+            let inline call (_ : ^w) =
+               ((^a or ^w) : (static member Bimap : _ * _ * _ -> _) f, g, x)
+            call Unchecked.defaultof<Bifunctor>
 
    [<AbstractClass; Sealed>]
 #if FABLE_COMPILER
@@ -1316,9 +1319,11 @@ module Typeclasses =
       static member inline Fold (f, acc, xs)                     = MSpan.fold f acc xs
 #endif
       static member inline Fold (f, acc, xs)                     = Set.fold f acc xs
-      static member inline Fold (f, acc, xs)                     = Map.fold (fun acc _ x -> f acc x) acc xs
 
-      static member inline InvokeFold (f : ^a -> _ -> ^a) (acc : ^a) (x : ^b) =
+      static member inline Fold (f, acc, xs) =
+         Map.fold (fun acc _ x -> f acc x) acc xs
+
+      static member inline InvokeFold ([<InlineIfLambda>] f : ^a -> _ -> ^a) (acc : ^a) (x : ^b) =
          let inline call (_ : ^w) = ((^b or ^w) : (static member Fold : _ * _ * _ -> _) f, acc, x)
          call
 
@@ -1412,12 +1417,12 @@ module Typeclasses =
 #endif
       static member inline Length (s, _ : Length)  = String.length s
 
-      static member inline Length (x : ^a, _ : Instance) = (^a : (member Count : unit -> int) x)
+      static member inline Length (x : ^a, _ : Instance) = (^a : (member Count : int) x)
 
       static member inline Length ((), _ : Length) = ()
 
       static member inline Invoke (x : ^a) =
-         let inline call (w : ^w) = ((^a or ^w) : (static member Length : _ * Instance -> _) x, w)
+         let inline call (w : ^w) = ((^a or ^w) : (static member Length : _ * _ -> _) x, w)
          call
 
    [<AbstractClass; Sealed>]
@@ -1433,13 +1438,14 @@ module Typeclasses =
       static member inline Item (k, xs, _ : Item) = Map.find k xs
       static member inline Item (i, s, _ : Item)  = String.item i s
 
-      static member inline Item (a, x : ^a, _ : Instance) = (^a : (member Item : _ -> _) x, a)
+#nowarn 77
+      static member inline Item (a, x : ^a, _ : Instance) = (^a : (member get_Item : _ -> _) x, a)
+#warnon 77
 
       static member inline Item ((), (), _ : Item) = ()
 
       static member inline InvokeItem a (x : ^a) =
-         let inline call (w : ^w) =
-            ((^a or ^w) : (static member Item : _ * _ * Instance -> _) a, x, w)
+         let inline call (w : ^w) = ((^a or ^w) : (static member Item : _ * _ * _ -> _) a, x, w)
          call
 
       static member inline TryItem (i, xs, _ : Item) = Seq.tryItem i xs
@@ -1459,9 +1465,10 @@ module Typeclasses =
       static member inline TryItem (a, xs, _ : Instance) =
          try Some <| Item.InvokeItem a xs Unchecked.defaultof<Item> with _ -> None
 
+      static member inline TryItem ((), (), _ : Item) = ()
+
       static member inline InvokeTryItem a (x : ^a) =
-         let inline call (w : ^w) =
-            ((^a or ^w) : (static member TryItem : _ * _ * Instance -> _) a, x, w)
+         let inline call (w : ^w) = ((^a or ^w) : (static member TryItem : _ * _ * _ -> _) a, x, w)
          call
 
    [<AbstractClass; Sealed>]
@@ -1489,7 +1496,7 @@ module Typeclasses =
       static member inline Head ((), _ : Head) = ()
 
       static member inline InvokeHead (x : ^a) =
-         let inline call (w : ^w) = ((^a or ^w) : (static member Head : _ * Instance -> _) x, w)
+         let inline call (w : ^w) = ((^a or ^w) : (static member Head : _ * _ -> _) x, w)
          call
 
       static member inline TryHead (xs, _ : Head) = Seq.tryHead xs
@@ -1511,7 +1518,7 @@ module Typeclasses =
       static member inline TryHead ((), _ : Head) = ()
 
       static member inline InvokeTryHead (x : ^a) =
-         let inline call (w : ^w) = ((^a or ^w) : (static member TryHead : _ * Instance -> _) x, w)
+         let inline call (w : ^w) = ((^a or ^w) : (static member TryHead : _ * _ -> _) x, w)
          call
 
    [<AbstractClass; Sealed>]
@@ -1528,10 +1535,8 @@ module Typeclasses =
       static member inline Tail (xs, _ : Tail) = MSpan.tail xs
 #endif
 
-      static member inline Tail ((), _ : Tail) = ()
-
       static member inline Invoke (x : ^a) =
-         let inline call (w : ^w) = ((^a or ^w) : (static member Tail : _ * Instance -> _) x, w)
+         let inline call (w : ^w) = ((^a or ^w) : (static member Tail : _ * _ -> _) x, w)
          call
 
    [<AbstractClass; Sealed>]
@@ -1580,8 +1585,7 @@ module Typeclasses =
          MVec.fold g <| Applicative.InvokeWrap MVec.empty <| xs
 
       static member inline InvokeTraverse ([<InlineIfLambda>] f : _ -> _) (x : ^a) =
-         let inline call (_ : ^w) =
-            ((^a or ^w) : (static member Traverse : _ * _ -> _) f, x)
+         let inline call (_ : ^w) = ((^a or ^w) : (static member Traverse : _ * _ -> _) f, x)
          call
 
       static member inline Traversev (f, xs) =
@@ -1602,10 +1606,10 @@ module Typeclasses =
          let inline g xs x = Validation.InvokeApplyv <| Functor.InvokeMap MVec.add (f x) <| xs
          MVec.fold g <| Applicative.InvokeWrap MVec.empty <| xs
 
-      static member inline InvokeTraversev (f : _ -> _) (x : ^a) =
-         let inline call (_ : ^w) =
-            ((^a or ^w) : (static member Traversev : _ * _ -> _) f, x)
+      static member inline InvokeTraversev ([<InlineIfLambda>] f : _ -> _) (x : ^a) =
+         let inline call (_ : ^w) = ((^a or ^w) : (static member Traversev : _ * _ -> _) f, x)
          call
+#warnon 64
 
 module Builders =
    open Typeclasses
@@ -1618,7 +1622,7 @@ module Builders =
       member inline _.YieldFrom x                          = x
       member inline _.BindReturn (x, [<InlineIfLambda>] f) = Functor.InvokeMap f x
 
-      member inline _.MergeSources (x, y) = Zipable.InvokeZip x y Unchecked.defaultof<Zipable>
+      member inline _.MergeSources (x, y) = Zipable.InvokeZip x y
 
       member inline _.Delay ([<InlineIfLambda>] f : unit -> _) = f
       member inline _.Run ([<InlineIfLambda>] f)               = f ()
@@ -1649,7 +1653,6 @@ module Builders =
 
       member inline _.MergeSources (x, y) = Validation.InvokeZipv x y
 
-#nowarn 1189
 [<AutoOpen>]
 module Operators =
    open Typeclasses
@@ -1685,12 +1688,14 @@ module Operators =
    let inline (=&) l r  = obj.ReferenceEquals (l, r)
    let inline (<>&) l r = obj.ReferenceEquals (l, r) |> not
 
-   let inline (=%)<'a when 'a :> System.IEquatable<'a>> (l : 'a) (r : 'a)  = l.Equals r
-   let inline (<>%)<'a when 'a :> System.IEquatable<'a>> (l : 'a) (r : 'a) = l.Equals r |> not
-   let inline (<%)<'a when 'a :> System.IComparable<'a>> (l : 'a) r        = l.CompareTo r < 0
-   let inline (<=%)<'a when 'a :> System.IComparable<'a>> (l : 'a) r       = l.CompareTo r <= 0
-   let inline (>%)<'a when 'a :> System.IComparable<'a>> (l : 'a) r        = l.CompareTo r > 0
-   let inline (>=%)<'a when 'a :> System.IComparable<'a>> (l : 'a) r       = l.CompareTo r >= 0
+#nowarn 1189
+   let inline (=%)< ^a when ^a :> System.IEquatable<^a>> (l : ^a) (r : ^a)  = l.Equals r
+   let inline (<>%)< ^a when ^a :> System.IEquatable<^a>> (l : ^a) (r : ^a) = l.Equals r |> not
+   let inline (<%)< ^a when ^a :> System.IComparable<^a>> (l : ^a) r        = l.CompareTo r < 0
+   let inline (<=%)< ^a when ^a :> System.IComparable<^a>> (l : ^a) r       = l.CompareTo r <= 0
+   let inline (>%)< ^a when ^a :> System.IComparable<^a>> (l : ^a) r        = l.CompareTo r > 0
+   let inline (>=%)< ^a when ^a :> System.IComparable<^a>> (l : ^a) r       = l.CompareTo r >= 0
+#warnon 1189
 
    let inline const' x _ = x
    let inline flip f x y = f y x
@@ -1718,7 +1723,7 @@ module Operators =
    let inline (<<|) ([<InlineIfLambda>] f) x = Functor.InvokeMap f x
    let inline (<!>) ([<InlineIfLambda>] f) x = Functor.InvokeMap f x
 
-   let inline zip x y = Zipable.InvokeZip x y Unchecked.defaultof<Zipable>
+   let inline zip x y = Zipable.InvokeZip x y
    let inline unzip x = Zipable.InvokeUnzip x Unchecked.defaultof<Zipable>
 
    let inline apply f x = Applicative.InvokeApply f x
@@ -1772,15 +1777,15 @@ module Operators =
    let inline foldBackWhile f x acc =
       Foldable.InvokeFoldBackWhile f x acc Unchecked.defaultof<Foldable>
 
-   let inline length x  = Length.Invoke x Unchecked.defaultof<Length>
-   let inline isEmpty x = Length.Invoke x Unchecked.defaultof<Length> = 0
+   let inline length x         = Length.Invoke x Unchecked.defaultof<Length>
+   let inline isEmpty (x : ^a) = Length.Invoke x Unchecked.defaultof<Length> = 0
 
    let inline item a x    = Item.InvokeItem a x Unchecked.defaultof<Item>
    let inline tryItem a x = Item.InvokeTryItem a x Unchecked.defaultof<Item>
 
-   let inline head x    = Head.InvokeHead x
-   let inline tryHead x = Head.InvokeTryHead x
-   let inline tail x    = Tail.Invoke x
+   let inline head x    = Head.InvokeHead x Unchecked.defaultof<Head>
+   let inline tryHead x = Head.InvokeTryHead x Unchecked.defaultof<Head>
+   let inline tail x    = Tail.Invoke x Unchecked.defaultof<Tail>
 
    let inline traverse ([<InlineIfLambda>] f) x =
       Traversable.InvokeTraverse f x Unchecked.defaultof<Traversable>
@@ -1788,8 +1793,8 @@ module Operators =
    let inline traversev ([<InlineIfLambda>] f) x =
       Traversable.InvokeTraversev f x Unchecked.defaultof<Traversable>
 
-   let inline sequence x    = Traversable.InvokeTraverse id x Unchecked.defaultof<Traversable>
-   let inline sequencev x   = Traversable.InvokeTraversev id x Unchecked.defaultof<Traversable>
+   let inline sequence x  = Traversable.InvokeTraverse id x Unchecked.defaultof<Traversable>
+   let inline sequencev x = Traversable.InvokeTraversev id x Unchecked.defaultof<Traversable>
 
    let applicative = Builders.Applicative ()
    let monad       = Builders.Monad ()
