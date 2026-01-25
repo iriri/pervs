@@ -15,16 +15,23 @@ type isize = nativeint
 type f32   = single
 type f64   = double
 
-type VOption<'a>                        = ValueOption<'a>
+type VOption<'a> = ValueOption<'a>
+type Array<'a>   = 'a[]
 #if !FABLE_COMPILER
-type Vec<'a>                            = System.Collections.Immutable.ImmutableList<'a>
+type Vec<'a>     = System.Collections.Immutable.ImmutableList<'a>
 #endif
-type Seq<'a>                            = seq<'a>
+type Seq<'a>     = seq<'a>
+
+type VSeq<'a, 'e when 'e :> System.Collections.Generic.IEnumerator<'a>> =
+   abstract member GetEnumerator : unit -> 'e
+
+type IEnumerator<'a>                    = System.Collections.Generic.IEnumerator<'a>
 type MVec<'a>                           = ResizeArray<'a>
 #if !FABLE_COMPILER
 type Span<'a>                           = System.ReadOnlySpan<'a>
 type MSpan<'a>                          = System.Span<'a>
 #endif
+type KeyValuePair<'k, 'v>               = System.Collections.Generic.KeyValuePair<'k, 'v>
 type HashSet<'k>                        = System.Collections.Generic.HashSet<'k>
 type HashMap<'k, 'v when 'k : not null> = System.Collections.Generic.Dictionary<'k, 'v>
 type String                             = string
@@ -221,6 +228,11 @@ module Choice =
    let        ofVOption = VOption.toChoice
    let        toVOption = VOption.ofChoice
 
+   let inline get x =
+      match x with
+      | Choice1Of2 a -> a
+      | Choice2Of2 b -> invalidArg "source" (sprintf "Value passed in was Choice2Of2: %O" b)
+
    let inline ofResult x =
       match x with
       | Ok a    -> Choice1Of2 a
@@ -318,6 +330,11 @@ module Result =
    let        ofChoice  = Choice.toResult
    let        toChoice  = Choice.ofResult
 
+   let inline get x =
+      match x with
+      | Ok a -> a
+      | Error e -> invalidArg "source" (sprintf "Value passed in was Error: %O" e)
+
    let inline defaultWith ([<InlineIfLambda>] f) x =
       match x with
       | Ok a    -> a
@@ -374,10 +391,21 @@ module Result =
       | Error _ -> acc
 
 module Seq =
-   let inline apply fs xs = fs |> Seq.collect (fun f -> Seq.map f xs)
+   type [<Struct>] VSeq<'a> (xs : Seq<'a>) =
+      interface VSeq<'a, IEnumerator<'a>> with
+         member _.GetEnumerator () = xs.GetEnumerator ()
 
-   let inline loop f acc (xs : Seq<_>) =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+   let inline ofVSeq (xs : #VSeq<'a, _>) = {
+      new Seq<'a> with
+         member _.GetEnumerator () : IEnumerator<'a>                = xs.GetEnumerator ()
+         member _.GetEnumerator () : System.Collections.IEnumerator = xs.GetEnumerator () }
+
+   let inline toVSeq xs = VSeq xs
+
+   let inline apply fs (xs : #Seq<_>) = fs |> Seq.collect (fun f -> Seq.map f xs)
+
+   let inline loop f acc (xs : #Seq<_>) =
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       use xs                 = xs.GetEnumerator ()
       while again && xs.MoveNext () do
@@ -386,24 +414,367 @@ module Seq =
          again <- again'
       acc
 
-   let inline loopBack f (xs : Seq<_>) acc =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+   let inline loopBack f (xs : #Seq<_>) acc =
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       let xs                 = xs |> Array.ofSeq |> Array.rev
       let mutable i          = 0
-      while again && i < Array.length xs do
+      while again && i < xs.Length do
          let acc', again' = f.Invoke (xs.[i], acc)
          acc <- acc'
          again <- again'
          i <- i + 1
       acc
 
+module VSeq' =
+   type [<Struct>] UnfoldEnumerator<'a, 'b> =
+      val private f : 'a -> VOption<struct('b * 'a)>
+      val mutable private state : 'a
+      val mutable private x : 'b
+      val private init : 'a
+
+      new (f, init) = { f = f; state = init; x = Unchecked.defaultof<_>; init = init }
+
+      interface IEnumerator<'b> with
+         member this.Current = this.x
+         member this.Current = box this.x
+
+         member this.MoveNext () =
+            match this.f this.state with
+            | ValueSome (x, s) ->
+               this.x <- x
+               this.state <- s
+               true
+            | ValueNone -> false
+
+         member this.Reset () = this.state <- this.init
+         member _.Dispose ()  = ()
+
+   type [<Struct>] Unfold<'a, 'b> (f : 'a -> VOption<struct('b * 'a)>, init : 'a) =
+      interface VSeq<'b, UnfoldEnumerator<'a, 'b>> with
+         member _.GetEnumerator () = new UnfoldEnumerator<_, _> (f, init)
+
+   type [<Struct>] AscendingEnumerator =
+      val mutable private m : int
+      val private n : int
+
+      new n = { m = n - 1; n = n - 1 }
+
+      interface IEnumerator<int> with
+         member this.Current = this.m
+         member this.Current = box this.m
+
+         member this.MoveNext () =
+            this.m <- this.m + 1
+            true
+
+         member this.Reset () = this.m <- this.n
+         member _.Dispose ()  = ()
+
+   type [<Struct>] Ascending (n : int) =
+      interface VSeq<int, AscendingEnumerator> with
+         member _.GetEnumerator () = new AscendingEnumerator (n)
+
+   type [<Struct>] TakeEnumerator<'a, 'e when 'e :> IEnumerator<'a>> =
+      val mutable private m : int
+      val private n : int
+      val mutable private e : 'e
+
+      new (n, e) = { m = n; n = n; e = e }
+
+      interface IEnumerator<'a> with
+         member this.Current = this.e.Current
+         member this.Current = box this.e.Current
+
+         member this.MoveNext () =
+            if this.m <= 0 then false else
+               this.m <- this.m - 1
+               this.e.MoveNext ()
+
+         member this.Reset () =
+            this.m <- this.n
+            this.e.Reset ()
+
+         member this.Dispose () = this.e.Dispose ()
+
+   type [<Struct>] Take<'a, 's, 'e when
+      's :> VSeq<'a, 'e> and 'e :> IEnumerator<'a>> (n : int, xs: 's) =
+         interface VSeq<'a, TakeEnumerator<'a, 'e>> with
+            member _.GetEnumerator () = new TakeEnumerator<_, _> (n, xs.GetEnumerator ())
+
+   type [<Struct>] TakeWhileEnumerator<'a, 'e when 'e :> IEnumerator<'a>> =
+      val mutable private done' : bool
+      val mutable private e : 'e
+      val private p : 'a -> bool
+
+      new(e, p) = { done' = false; e = e; p = p }
+
+      interface IEnumerator<'a> with
+         member this.Current = this.e.Current
+         member this.Current = box this.e.Current
+
+         member this.MoveNext () =
+            if this.done' then false
+            elif this.e.MoveNext () && this.p this.e.Current then true else
+               this.done' <- true
+               false
+
+         member this.Reset () =
+            this.done' <- false
+            this.e.Reset ()
+
+         member this.Dispose () = this.e.Dispose ()
+
+   type [<Struct>] TakeWhile<'a, 's, 'e when
+      's :> VSeq<'a, 'e> and 'e :> IEnumerator<'a>> (xs: 's, p: 'a -> bool) =
+         interface VSeq<'a, TakeWhileEnumerator<'a, 'e>> with
+            member _.GetEnumerator () = new TakeWhileEnumerator<_, _> (xs.GetEnumerator (), p)
+
+   type [<Struct>] SkipEnumerator<'a, 'e when 'e :> IEnumerator<'a>> =
+      val mutable private m : int
+      val private n : int
+      val mutable private e : 'e
+
+      new (n, e) = { m = n; n = n; e = e }
+
+      interface IEnumerator<'a> with
+         member this.Current = this.e.Current
+         member this.Current = box this.e.Current
+
+         member this.MoveNext () =
+            while this.m > 0 && this.e.MoveNext () do
+               this.m <- this.m - 1
+            if this.m = 0 then this.e.MoveNext () else false
+
+         member this.Reset () =
+            this.m <- this.n
+            this.e.Reset ()
+
+         member this.Dispose () = this.e.Dispose ()
+
+   type [<Struct>] Skip<'a, 's, 'e when
+      's :> VSeq<'a, 'e> and 'e :> IEnumerator<'a>> (n : int, xs: 's) =
+         interface VSeq<'a, SkipEnumerator<'a, 'e>> with
+            member _.GetEnumerator () = new SkipEnumerator<_, _> (n, xs.GetEnumerator ())
+
+   type [<Struct>] SkipWhileEnumerator<'a, 'e when 'e :> IEnumerator<'a>> =
+      val mutable private done' : bool
+      val mutable private e : 'e
+      val private p : 'a -> bool
+
+      new(e, p) = { done' = false; e = e; p = p }
+
+      interface IEnumerator<'a> with
+         member this.Current = this.e.Current
+         member this.Current = box this.e.Current
+
+         member this.MoveNext () =
+            if this.done' then this.e.MoveNext () else
+               let mutable ok = true
+               while not this.done' do
+                  if not (this.e.MoveNext ()) then
+                     ok <- false
+                     this.done' <- true
+                  elif not (this.p this.e.Current) then
+                     this.done' <- true
+               ok
+
+         member this.Reset () =
+            this.done' <- false
+            this.e.Reset ()
+
+         member this.Dispose () = this.e.Dispose ()
+
+   type [<Struct>] SkipWhile<'a, 's, 'e when
+      's :> VSeq<'a, 'e> and 'e :> IEnumerator<'a>> (xs: 's, p: 'a -> bool) =
+         interface VSeq<'a, SkipWhileEnumerator<'a, 'e>> with
+            member _.GetEnumerator () = new SkipWhileEnumerator<_, _> (xs.GetEnumerator (), p)
+
+   type [<Struct>] MapEnumerator<'a, 'b, 'e when 'e :> IEnumerator<'a>> =
+      val mutable private e : 'e
+      val private f : 'a -> 'b
+
+      new (e, f) = { e = e; f = f }
+
+      interface IEnumerator<'b> with
+         member this.Current = this.f this.e.Current
+         member this.Current = box (this.f this.e.Current)
+
+         member this.MoveNext () = this.e.MoveNext ()
+
+         member this.Reset ()   = this.e.Reset ()
+         member this.Dispose () = this.e.Dispose ()
+
+   type [<Struct>] Map<'a, 'b, 's, 'e when
+      's :> VSeq<'a, 'e> and 'e :> IEnumerator<'a>> (xs : 's, f : 'a -> 'b) =
+         interface VSeq<'b, MapEnumerator<'a, 'b, 'e>> with
+            member _.GetEnumerator () = new MapEnumerator<_, _, _> (xs.GetEnumerator (), f)
+
+   type [<Struct>] ZipEnumerator<'a, 'b, 'e, 'f when
+      'e :> IEnumerator<'a> and 'f :> IEnumerator<'b>> =
+         val mutable private e : 'e
+         val mutable private f : 'f
+
+         new (e, f) = { e = e; f = f }
+
+         interface IEnumerator<struct('a * 'b)> with
+            member this.Current = struct(this.e.Current, this.f.Current)
+            member this.Current = box struct(this.e.Current, this.f.Current)
+
+            member this.MoveNext () = this.e.MoveNext () && this.f.MoveNext ()
+
+            member this.Reset () =
+               this.e.Reset ()
+               this.f.Reset ()
+
+            member this.Dispose () =
+               this.e.Dispose ()
+               this.f.Dispose ()
+
+   type [<Struct>] Zip<'a, 'b, 's, 't, 'e, 'f when
+      's :> VSeq<'a, 'e> and
+      't :> VSeq<'b, 'f> and
+      'e :> IEnumerator<'a> and
+      'f :> IEnumerator<'b>> (xs : 's, ys : 't) =
+         interface VSeq<struct('a * 'b), ZipEnumerator<'a, 'b, 'e, 'f>> with
+            member _.GetEnumerator () =
+               new ZipEnumerator<_, _, _, _> (xs.GetEnumerator (), ys.GetEnumerator ())
+
+   type [<Struct>] FilterEnumerator<'a, 'e when 'e :> IEnumerator<'a>> =
+      val mutable private e : 'e
+      val private p : 'a -> bool
+
+      new(e, p) = { e = e; p = p }
+
+      interface IEnumerator<'a> with
+         member this.Current = this.e.Current
+         member this.Current = box this.e.Current
+
+         member this.MoveNext () =
+            let mutable ok = this.e.MoveNext ()
+            while ok && not (this.p this.e.Current) do
+               ok <- this.e.MoveNext ()
+            ok
+
+         member this.Reset ()   = this.e.Reset ()
+         member this.Dispose () = this.e.Dispose ()
+
+   type [<Struct>] Filter<'a, 's, 'e when 's :> VSeq<'a, 'e> and 'e :> IEnumerator<'a>>(
+      xs : 's, p: 'a -> bool) =
+         interface VSeq<'a, FilterEnumerator<'a, 'e>> with
+            member _.GetEnumerator () = new FilterEnumerator<_, _> (xs.GetEnumerator (), p)
+
+   type [<Struct>] ChooseEnumerator<'a, 'b, 'e when 'e :> IEnumerator<'a>> =
+      val mutable private e : 'e
+      val mutable private x : 'b
+      val private f : 'a -> VOption<'b>
+
+      new(e, f) = { e = e; x = Unchecked.defaultof<_>; f = f }
+
+      interface IEnumerator<'b> with
+         member this.Current = this.x
+         member this.Current = box this.x
+
+         member this.MoveNext () =
+            let mutable ok, again = this.e.MoveNext (), true
+            while ok && again do
+               match this.f this.e.Current with
+               | ValueSome x ->
+                  this.x <- x
+                  again <- false
+               | ValueNone -> ok <- this.e.MoveNext ()
+            ok
+
+         member this.Reset ()   = this.e.Reset ()
+         member this.Dispose () = this.e.Dispose ()
+
+   type [<Struct>] Choose<'a, 'b, 's, 'e when 's :> VSeq<'a, 'e> and 'e :> IEnumerator<'a>>(
+      xs : 's, f: 'a -> VOption<'b>) =
+         interface VSeq<'b, ChooseEnumerator<'a, 'b, 'e>> with
+            member _.GetEnumerator () = new ChooseEnumerator<_, _, _> (xs.GetEnumerator (), f)
+
+   let inline unfold f init = Unfold (f, init)
+   let inline ascending n   = Ascending n
+
+   let inline take n xs      = Take (n, xs)
+   let inline takeWhile p xs = TakeWhile (xs, p)
+   let inline skip n xs      = Skip (n, xs)
+   let inline skipWhile p xs = SkipWhile (xs, p)
+
+   let inline map f xs   = Map<_, _, _, _> (xs, f)
+   let inline zip xs ys  = Zip (xs, ys)
+   let inline indexed xs = Zip (ascending 0, xs)
+
+   let inline filter f xs = Filter (xs, f)
+   let inline choose f xs = Choose (xs, f)
+
+   let inline length (xs : #VSeq<_, _>) =
+      let mutable n = 0
+      use mutable e = xs.GetEnumerator ()
+      while e.MoveNext () do n <- n + 1
+      n
+
+   let inline iter f (xs : #VSeq<_, _>) =
+      use mutable e = xs.GetEnumerator ()
+      while e.MoveNext () do f e.Current
+
+   let inline fold f acc (xs : #VSeq<_, _>) =
+      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
+      let mutable acc = acc
+      use mutable e   = xs.GetEnumerator ()
+      while e.MoveNext () do acc <- f.Invoke (acc, e.Current)
+      acc
+
+   let inline loop f acc (xs : #VSeq<_, _>) =
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
+      let mutable acc, again = acc, true
+      use mutable e          = xs.GetEnumerator ()
+      while again && e.MoveNext () do
+         let acc', again' = f.Invoke (acc, e.Current)
+         acc <- acc'
+         again <- again'
+      acc
+
+   let inline forall p (xs : #VSeq<_, _>) =
+      let mutable ok = true
+      use mutable e  = xs.GetEnumerator ()
+      while ok && e.MoveNext () do
+         ok <- p e.Current
+      ok
+
+   let inline exists p (xs : #VSeq<_, _>) =
+      let mutable ok = false
+      use mutable e  = xs.GetEnumerator ()
+      while not ok && e.MoveNext () do
+         ok <- p e.Current
+      ok
+
+#nowarn 1204
+   let inline head (xs : #VSeq<_, _>) =
+      use mutable e = xs.GetEnumerator ()
+      if e.MoveNext () then e.Current else
+         invalidArg "source" FSharp.Core.LanguagePrimitives.ErrorStrings.InputSequenceEmptyString
+#warnon 1204
+
+   let inline tryHead (xs : #VSeq<_, _>) =
+      use mutable e = xs.GetEnumerator ()
+      if e.MoveNext () then Some e.Current else None
+
+   let inline tail xs = skip 1 xs
+
 module List =
+   type [<Struct>] VSeq<'a> (xs : List<'a>) =
+      interface VSeq<'a, IEnumerator<'a>> with
+         member _.GetEnumerator () = (xs :> Seq<_>).GetEnumerator ()
+
+   let inline ofVSeq xs = xs |> Seq.ofVSeq |> List.ofSeq
+   let inline toVSeq xs = VSeq xs
+
    let inline add x xs    = x :: xs
    let inline apply fs xs = fs |> List.collect (fun f -> List.map f xs)
 
    let inline loop f acc (xs : List<_>) =
-      let f             = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f             = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let rec loop' acc = function
          | []      -> acc
          | x :: xs -> loop' (f.Invoke (acc, x)) xs
@@ -416,7 +787,7 @@ type System.ReadOnlySpan<'a> with
    member inline this.GetSlice (off, end') =
       match off, end' with
       | None, None          -> this
-      | Some off, None      -> this.Slice (off)
+      | Some off, None      -> this.Slice off
       | None, Some end'     -> this.Slice (0, end' + 1)
       | Some off, Some end' -> this.Slice (off, end' - off + 1)
 
@@ -446,19 +817,19 @@ module Span =
       xs'.ToArray ()
 
    let inline fold f acc xs =
-      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc = acc
       for i = 0 to length xs - 1 do acc <- f.Invoke (acc, xs.[i])
       acc
 
    let inline foldBack f xs acc =
-      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc = acc
       for i = length xs - 1 downto 0 do acc <- f.Invoke (xs.[i], acc)
       acc
 
    let inline loop f acc xs =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       let mutable i          = 0
       while again && i < length xs do
@@ -469,7 +840,7 @@ module Span =
       acc
 
    let inline loopBack f xs acc =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       let mutable i          = length xs - 1
       while again && i >= 0 do
@@ -483,7 +854,7 @@ type System.Span<'a> with
    member inline this.GetSlice (off, end') =
       match off, end' with
       | None, None          -> this
-      | Some off, None      -> this.Slice (off)
+      | Some off, None      -> this.Slice off
       | None, Some end'     -> this.Slice (0, end' + 1)
       | Some off, Some end' -> this.Slice (off, end' - off + 1)
 
@@ -513,6 +884,31 @@ module MSpan =
 #endif
 
 module Array =
+   type [<Struct>] VEnumerator<'a> =
+      val mutable private i : int
+      val private xs : 'a[]
+
+      new xs = { i = -1; xs = xs }
+
+      interface IEnumerator<'a> with
+         member this.Current = this.xs[this.i]
+         member this.Current = box this.xs[this.i]
+
+         member this.MoveNext () =
+            if this.i >= this.xs.Length - 1 then false else
+               this.i <- this.i + 1
+               true
+
+         member this.Reset () = this.i <- -1
+         member _.Dispose ()  = ()
+
+   type [<Struct>] VSeq<'a> (xs : 'a[]) =
+      interface VSeq<'a, VEnumerator<'a>> with
+         member _.GetEnumerator () = new VEnumerator<_> (xs)
+
+   let inline ofVSeq xs = xs |> Seq.ofVSeq |> Array.ofSeq
+   let inline toVSeq xs = VSeq xs
+
 #if !FABLE_COMPILER
    let inline ofSpan xs             = Span.toArray xs
    let inline toSpan xs             = Span.ofArray xs
@@ -526,7 +922,7 @@ module Array =
    let inline loopBack f (xs : _[]) acc = Span.loopBack f (Span.ofArray xs) acc
 #else
    let inline loop f acc (xs : _[]) =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       let mutable i          = 0
       while again && i < xs.Length do
@@ -537,7 +933,7 @@ module Array =
       acc
 
    let inline loopBack f (xs : _[]) acc =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       let mutable i          = xs.Length - 1
       while again && i >= 0 do
@@ -553,11 +949,17 @@ module Array =
 
 #if !FABLE_COMPILER
 module Vec =
-   let inline empty<^a>          = System.Collections.Immutable.ImmutableList.Create<^a> ()
+   type [<Struct>] VSeq<'a> (xs : Vec<'a>) =
+      interface VSeq<'a, IEnumerator<'a>> with
+         member _.GetEnumerator () = (xs :> Seq<_>).GetEnumerator ()
+
+   let inline empty<^a>          = System.Collections.Immutable.ImmutableList<^a>.Empty
    let inline singleton (x : ^a) = System.Collections.Immutable.ImmutableList.Create x
 
    let        ofSeq                 = System.Collections.Immutable.ImmutableList.CreateRange
    let inline toSeq (xs : Vec<_>)   = xs :> Seq<_>
+   let inline ofVSeq xs             = xs |> Seq.ofVSeq |> ofSeq
+   let inline toVSeq xs             = VSeq xs
    let inline ofList (xs : List<_>) = ofSeq xs
    let inline toList (xs : Vec<_>)  = List.ofSeq xs
    let inline ofArray (xs : ^a[])   = System.Collections.Immutable.ImmutableList.Create<^a> xs
@@ -600,7 +1002,7 @@ module Vec =
       b.ToImmutable ()
 
    let inline fold f acc (xs : Vec<_>) =
-      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc = acc
       xs |> iter (fun x -> acc <- f.Invoke (acc, x))
       acc
@@ -611,22 +1013,51 @@ module Vec =
 #endif
 
 module MVec =
+   type [<Struct>] VEnumerator<'a> =
+      val mutable private i : int
+      val private xs : MVec<'a>
+
+      new xs = { i = -1; xs = xs }
+
+      interface IEnumerator<'a> with
+         member this.Current = this.xs[this.i]
+         member this.Current = box this.xs[this.i]
+
+         member this.MoveNext () =
+            if this.i >= this.xs.Count - 1 then false else
+               this.i <- this.i + 1
+               true
+
+         member this.Reset () = this.i <- -1
+         member _.Dispose ()  = ()
+
+   type [<Struct>] VSeq<'a> (xs : MVec<'a>) =
+      interface VSeq<'a, VEnumerator<'a>> with
+         member _.GetEnumerator () = new VEnumerator<_> (xs)
+
    let inline empty<^a> : MVec<^a> = MVec ()
 
    let inline singleton x =
-      let xs = MVec ()
+      let xs = MVec 1
       xs.Add x
       xs
 
    let inline ofSeq (xs : Seq<_>)    = MVec xs
    let inline toSeq (xs : MVec<_>)   = xs :> Seq<_>
+
+   let inline ofVSeq (xs : #VSeq<_, _>) =
+      let ys = MVec ()
+      xs |> VSeq'.iter (fun x -> ys.Add x)
+      ys
+
+   let inline toVSeq xs              = VSeq xs
    let inline ofList (xs : List<_>)  = MVec xs
    let inline toList  (xs : MVec<_>) = Seq.toList xs
    let inline ofArray (xs : _[])     = MVec xs
    let inline toArray (xs : MVec<_>) = xs.ToArray ()
 #if !FABLE_COMPILER
    let inline ofSpan (xs : Span<_>) =
-      let ys = MVec ()
+      let ys = MVec xs.Length
       System.Collections.Generic.CollectionExtensions.AddRange (ys, xs)
       ys
 
@@ -671,19 +1102,19 @@ module MVec =
       xs'
 
    let inline fold f acc (xs : MVec<_>) =
-      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc = acc
       xs |> iter (fun x -> acc <- f.Invoke (acc, x))
       acc
 
    let inline foldBack f (xs : MVec<_>) acc =
-      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f           = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc = acc
       for i = length xs - 1 downto 0 do acc <- f.Invoke (xs.[i], acc)
       acc
 
    let inline loop f acc (xs : MVec<_>) =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       let mutable i          = 0
       while again && i < length xs do
@@ -694,7 +1125,7 @@ module MVec =
       acc
 
    let inline loopBack f (xs : MVec<_>) acc =
-      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt (f)
+      let f                  = OptimizedClosures.FSharpFunc<_, _, _>.Adapt f
       let mutable acc, again = acc, true
       let mutable i          = length xs - 1
       while again && i >= 0 do
@@ -726,18 +1157,99 @@ type System.Collections.Generic.List<'a> with
          true
 
 module Set =
+   type [<Struct>] VSeq<'a when 'a : comparison> (xs : Set<'a>) =
+      interface VSeq<'a, IEnumerator<'a>> with
+         member _.GetEnumerator () = (xs :> Seq<_>).GetEnumerator ()
+
+   let inline ofVSeq xs = xs |> Seq.ofVSeq |> Set.ofSeq
+   let inline toVSeq xs = VSeq xs
+
    let        head       = Set.minElement
    let inline tryHead xs = if Set.isEmpty xs then None else Some (head xs)
    let        last       = Set.maxElement
    let inline tryLast xs = if Set.isEmpty xs then None else Some (last xs)
 
 module Map =
+   type private VSeq'<'a, 'e when 'e :> IEnumerator<'a>> = VSeq<'a, 'e>
+
+   type [<Struct>] VSeq<'k, 'v when 'k : comparison> (xs : Map<'k, 'v>) =
+      interface VSeq'<KeyValuePair<'k, 'v>, IEnumerator<KeyValuePair<'k, 'v>>> with
+         member _.GetEnumerator () = (xs :> Seq<_>).GetEnumerator ()
+
+   let inline ofVSeq xs = xs |> Seq.ofVSeq |> Map.ofSeq
+   let inline toVSeq xs = VSeq xs
+
    let        head       = Map.minKeyValue
    let inline tryHead xs = if Map.isEmpty xs then None else Some (head xs)
    let        last       = Map.maxKeyValue
    let inline tryLast xs = if Map.isEmpty xs then None else Some (last xs)
 
+module HashSet =
+   type [<Struct>] VSeq<'a> (xs : HashSet<'a>) =
+      interface VSeq<'a, IEnumerator<'a>> with
+         member _.GetEnumerator () = (xs :> Seq<_>).GetEnumerator ()
+
+   let inline empty<^a> : HashSet<^a> = HashSet ()
+
+   let inline singleton x =
+      let xs = HashSet ()
+      xs.Add x |> ignore
+      xs
+
+   let ofSeq (xs : Seq<_>)     = HashSet xs
+   let toSeq (xs : HashSet<_>) = xs :> Seq<_>
+   let inline ofVSeq xs        = xs |> Seq.ofVSeq |> ofSeq
+   let inline toVSeq xs        = VSeq xs
+
+   let inline add x (xs : HashSet<_>) =
+      xs.Add x |> ignore
+      xs
+
+module HashMap =
+   type private VSeq'<'a, 'e when 'e :> IEnumerator<'a>> = VSeq<'a, 'e>
+
+   type [<Struct>] VSeq<'k, 'v when 'k : not null> (xs : HashMap<'k, 'v>) =
+      interface VSeq'<KeyValuePair<'k, 'v>, IEnumerator<KeyValuePair<'k, 'v>>> with
+         member _.GetEnumerator () = (xs :> Seq<_>).GetEnumerator ()
+
+   let inline empty<^k, ^v when ^k : not null and 'k : equality> : HashMap<^k, ^v> = HashMap ()
+
+   let ofSeq (xs : Seq<_>)     = HashSet xs
+   let toSeq (xs : HashSet<_>) = xs :> Seq<_>
+   let inline ofVSeq xs        = xs |> Seq.ofVSeq |> ofSeq
+   let inline toVSeq xs        = VSeq xs
+
+   let inline add k v (xs : HashMap<_, _>) =
+      xs[k] = v |> ignore
+      xs
+
 module String =
+   type [<Struct>] VEnumerator =
+      val mutable private i : int
+      val private s : String
+
+      new s = { i = -1; s = s }
+
+      interface IEnumerator<char> with
+         member this.Current = this.s[this.i]
+         member this.Current = box this.s[this.i]
+
+         member this.MoveNext () =
+            if this.i >= this.s.Length - 1 then false else
+               this.i <- this.i + 1
+               true
+
+         member this.Reset () = this.i <- -1
+         member _.Dispose ()  = ()
+
+   type [<Struct>] VSeq (s : String) =
+      interface VSeq<char, VEnumerator> with
+         member _.GetEnumerator () = new VEnumerator (s)
+
+   let inline ofSeq xs                  = String (Array.ofSeq xs)
+   let inline toSeq (s : String)        = s :> Seq<_>
+   let inline ofVSeq xs                 = xs |> Seq.ofVSeq |> ofSeq
+   let inline toVSeq s                  = VSeq s
    let inline ofArray (cs : char[])     = String cs
    let inline toArray (s : String)      = s.ToCharArray ()
 #if !FABLE_COMPILER
@@ -751,7 +1263,7 @@ module String =
    let inline tryItem i s          = if i < String.length s then Some s.[i] else None
    let inline head (s : String)    = s.[0]
    let inline tryHead (s : String) = if isEmpty s then None else Some (head s)
-   let inline last (s : String)    = s.[String.length s - 1]
+   let inline last (s : String)    = s.[s.Length - 1]
 
    let inline tryLast s =
       match String.length s with
@@ -818,27 +1330,27 @@ module Typeclasses =
                (static member Tup3 : _ * _ * _ * _ -> _) a, b, c, Unchecked.defaultof<^a>)
          call Unchecked.defaultof<Tuple>
 
-      static member inline Fst ((a, _))                                            = a
+      static member inline Fst ((a, _))                 = a
 #if !FABLE_COMPILER
-      static member inline Fst struct(a, _)                                        = a
+      static member inline Fst struct(a, _)             = a
 #endif
-      static member inline Fst ((a, _, _))                                         = a
+      static member inline Fst ((a, _, _))              = a
 #if !FABLE_COMPILER
-      static member inline Fst struct(a, _, _)                                     = a
+      static member inline Fst struct(a, _, _)          = a
 #endif
-      static member inline Fst (x : System.Collections.Generic.KeyValuePair<_, _>) = x.Key
-      static member inline Snd ((_, b))                                            = b
+      static member inline Fst (x : KeyValuePair<_, _>) = x.Key
+      static member inline Snd ((_, b))                 = b
 #if !FABLE_COMPILER
-      static member inline Snd struct(_, b)                                        = b
+      static member inline Snd struct(_, b)             = b
 #endif
-      static member inline Snd ((_, b, _))                                         = b
+      static member inline Snd ((_, b, _))              = b
 #if !FABLE_COMPILER
-      static member inline Snd struct(_, b, _)                                     = b
+      static member inline Snd struct(_, b, _)          = b
 #endif
-      static member inline Snd (x : System.Collections.Generic.KeyValuePair<_, _>) = x.Value
-      static member inline Trd ((_, _, c))                                         = c
+      static member inline Snd (x : KeyValuePair<_, _>) = x.Value
+      static member inline Trd ((_, _, c))              = c
 #if !FABLE_COMPILER
-      static member inline Trd struct(_, _, c)                                     = c
+      static member inline Trd struct(_, _, c)          = c
 #endif
 
       static member inline InvokeFst x =
@@ -867,7 +1379,7 @@ module Typeclasses =
 #if !FABLE_COMPILER
       static member inline Zero (_ : Vec<_>)     = Vec.empty
 #endif
-      static member inline Zero (_ : MVec<_>)    = MVec.empty
+      static member inline Zero (_ : MVec<_>)    = MVec ()
       static member inline Zero (_ : Set<_>)     = Set.empty
       static member inline Zero (_ : String)     = ""
 
@@ -906,13 +1418,32 @@ module Typeclasses =
 #if FABLE_COMPILER
    [<Fable.Core.Erase>]
 #endif
+   type ToVSeq =
+      static member inline ToVSeq xs                 = List.toVSeq xs
+      static member inline ToVSeq xs                 = Array.toVSeq xs
+      static member inline ToVSeq xs                 = Seq.toVSeq xs
+      static member inline ToVSeq (xs : #VSeq<_, _>) = xs
+      static member inline ToVSeq xs                 = Vec.toVSeq xs
+      static member inline ToVSeq xs                 = MVec.toVSeq xs
+      static member inline ToVSeq xs                 = Set.toVSeq xs
+      static member inline ToVSeq xs                 = Map.toVSeq xs
+      static member inline ToVSeq xs                 = HashSet.toVSeq xs
+      static member inline ToVSeq xs                 = HashMap.toVSeq xs
+
+      static member inline Invoke x =
+         let inline call (x : ^a) (_ : ^w) = ((^a or ^w) : (static member ToVSeq : _ -> _) x)
+         call x Unchecked.defaultof<ToVSeq>
+
+   [<AbstractClass; Sealed>]
+#if FABLE_COMPILER
+   [<Fable.Core.Erase>]
+#endif
    type Functor =
       static member inline Map ([<InlineIfLambda>] f, (a, b))       = f a, b
       static member inline Map ([<InlineIfLambda>] f, struct(a, b)) = struct(f a, b)
 
-      static member inline Map (
-         [<InlineIfLambda>] f, x : System.Collections.Generic.KeyValuePair<_, _>) =
-            System.Collections.Generic.KeyValuePair (f x.Key, x.Value)
+      static member inline Map ([<InlineIfLambda>] f, x : KeyValuePair<_, _>) =
+         KeyValuePair (f x.Key, x.Value)
 
       static member inline Map ([<InlineIfLambda>] f, g)  = g >> f
       static member inline Map ([<InlineIfLambda>] f, x)  = Lazy.map f x
@@ -924,6 +1455,7 @@ module Typeclasses =
       static member inline Map ([<InlineIfLambda>] f, x)  = Choice.map f x
       static member inline Map ([<InlineIfLambda>] f, x)  = Result.map f x
       static member inline Map ([<InlineIfLambda>] f, xs) = Seq.map f xs
+      static member inline Map ([<InlineIfLambda>] f, xs) = VSeq'.map f xs
       static member inline Map ([<InlineIfLambda>] f, xs) = List.map f xs
       static member inline Map ([<InlineIfLambda>] f, xs) = Array.map f xs
 #if !FABLE_COMPILER
@@ -948,12 +1480,9 @@ module Typeclasses =
             ((^a or ^b or ^w) : (static member Map : _ * _ -> _) f, x)
          call x Unchecked.defaultof<Functor>
 
-      static member inline Iter ([<InlineIfLambda>] f, (a, _)) : unit       = f a
-      static member inline Iter ([<InlineIfLambda>] f, struct(a, _)) : unit = f a
-
-      static member inline Iter (
-         [<InlineIfLambda>] f, x : System.Collections.Generic.KeyValuePair<_, _>) : unit =
-            f x.Key
+      static member inline Iter ([<InlineIfLambda>] f, (a, _)) : unit                 = f a
+      static member inline Iter ([<InlineIfLambda>] f, struct(a, _)) : unit           = f a
+      static member inline Iter ([<InlineIfLambda>] f, x : KeyValuePair<_, _>) : unit = f x.Key
 
       static member inline Iter ([<InlineIfLambda>] f, x)  = x |> Lazy.force |> f
       static member inline Iter ([<InlineIfLambda>] f, x)  = Option.iter f x
@@ -963,6 +1492,7 @@ module Typeclasses =
       static member inline Iter ([<InlineIfLambda>] f, x)  = Choice.iter f x
       static member inline Iter ([<InlineIfLambda>] f, x)  = Result.iter f x
       static member inline Iter ([<InlineIfLambda>] f, xs) = Seq.iter f xs
+      static member inline Iter ([<InlineIfLambda>] f, xs) = VSeq'.iter f xs
       static member inline Iter ([<InlineIfLambda>] f, xs) = List.iter f xs
       static member inline Iter ([<InlineIfLambda>] f, xs) = Array.iter f xs
 #if !FABLE_COMPILER
@@ -1002,6 +1532,7 @@ module Typeclasses =
       static member inline Zip (x, y)   = Choice.zip x y
       static member inline Zip (x, y)   = Result.zip x y
       static member inline Zip (xs, ys) = Seq.zip xs ys
+      static member inline Zip (xs, ys) = VSeq'.zip xs ys
       static member inline Zip (xs, ys) = List.zip xs ys
       static member inline Zip (xs, ys) = Array.zip xs ys
 
@@ -1133,9 +1664,8 @@ module Typeclasses =
       static member inline MapSnd ([<InlineIfLambda>] f, (a, b))       = a, f b
       static member inline MapSnd ([<InlineIfLambda>] f, struct(a, b)) = struct(a, f b)
 
-      static member inline MapSnd (
-         [<InlineIfLambda>] f, x : System.Collections.Generic.KeyValuePair<_, _>) =
-            System.Collections.Generic.KeyValuePair (x.Key, f x.Value)
+      static member inline MapSnd ([<InlineIfLambda>] f, x : KeyValuePair<_, _>) =
+         KeyValuePair (x.Key, f x.Value)
 
       static member inline MapSnd ([<InlineIfLambda>] f, x) = Choice.map2Of2 f x
       static member inline MapSnd ([<InlineIfLambda>] f, x) = Result.mapError f x
@@ -1148,9 +1678,8 @@ module Typeclasses =
       static member inline IterSnd ([<InlineIfLambda>] f, (_, b)) : unit       = f b
       static member inline IterSnd ([<InlineIfLambda>] f, struct(_, b)) : unit = f b
 
-      static member inline IterSnd (
-         [<InlineIfLambda>] f, x : System.Collections.Generic.KeyValuePair<_, _>) : unit =
-            f x.Value
+      static member inline IterSnd ([<InlineIfLambda>] f, x : KeyValuePair<_, _>) : unit =
+         f x.Value
 
       static member inline IterSnd ([<InlineIfLambda>] f, x) = Choice.iter2Of2 f x
       static member inline IterSnd ([<InlineIfLambda>] f, x) = Result.iterError f x
@@ -1166,10 +1695,8 @@ module Typeclasses =
          struct(f a, g b)
 
       static member inline Bimap (
-         [<InlineIfLambda>] f,
-         [<InlineIfLambda>] g,
-         x : System.Collections.Generic.KeyValuePair<_, _>) =
-            System.Collections.Generic.KeyValuePair (f x.Key, g x.Value)
+         [<InlineIfLambda>] f, [<InlineIfLambda>] g, x : KeyValuePair<_, _>) =
+            KeyValuePair (f x.Key, g x.Value)
 
       static member inline Bimap ([<InlineIfLambda>] f, [<InlineIfLambda>] g, x) =
          Choice.bimap f g x
@@ -1369,11 +1896,14 @@ module Typeclasses =
    [<Fable.Core.Erase>]
 #endif
    type Filter =
+      inherit Priority0
+
       static member inline Filter ([<InlineIfLambda>] f, x)  = Option.filter f x
 #if !FABLE_COMPILER
       static member inline Filter ([<InlineIfLambda>] f, x)  = VOption.filter f x
 #endif
       static member inline Filter ([<InlineIfLambda>] f, xs) = Seq.filter f xs
+      static member inline Filter ([<InlineIfLambda>] f, xs) = VSeq'.filter f xs
       static member inline Filter ([<InlineIfLambda>] f, xs) = List.filter f xs
       static member inline Filter ([<InlineIfLambda>] f, xs) = Array.filter f xs
 #if !FABLE_COMPILER
@@ -1385,9 +1915,33 @@ module Typeclasses =
       static member inline Filter ([<InlineIfLambda>] f, xs) = MSpan.filter f xs
 #endif
 
-      static member inline Invoke ([<InlineIfLambda>] f : _ -> bool) x =
+      static member inline InvokeFilter ([<InlineIfLambda>] f : _ -> bool) x =
          let inline call (x : ^a) (_ : ^w) =
             ((^a or ^w) : (static member Filter : _ * _ -> _) f, x)
+         call x Unchecked.defaultof<Filter>
+
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Priority0) = Seq.choose f xs
+
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Filter) =
+         VSeq'.choose (f >> VOption.ofOption) xs
+
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Filter) = List.choose f xs
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Filter) = Array.choose f xs
+
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Priority0) =
+         Seq.choose (f >> Option.ofVOption) xs
+
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Filter) = VSeq'.choose f xs
+
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Filter) =
+         List.choose (f >> Option.ofVOption) xs
+
+      static member inline Choose ([<InlineIfLambda>] f, xs, _ : Filter) =
+         Array.choose (f >> Option.ofVOption) xs
+
+      static member inline InvokeChoose ([<InlineIfLambda>] f : _ -> _) x =
+         let inline call (x : ^a) (w : ^w) =
+            ((^a or ^w) : (static member Choose : _ * _ * _ -> _) f, x, w)
          call x Unchecked.defaultof<Filter>
 
    [<AbstractClass; Sealed>]
@@ -1404,6 +1958,7 @@ module Typeclasses =
       static member inline Fold (([<InlineIfLambda>] f), acc, x) = Choice.fold f acc x
       static member inline Fold (([<InlineIfLambda>] f), acc, x) = Result.fold f acc x
       static member inline Fold (f, acc, xs)                     = Seq.fold f acc xs
+      static member inline Fold (f, acc, xs)                     = VSeq'.fold f acc xs
       static member inline Fold (f, acc, xs)                     = List.fold f acc xs
       static member inline Fold (f, acc, xs)                     = Array.fold f acc xs
 #if !FABLE_COMPILER
@@ -1444,6 +1999,7 @@ module Typeclasses =
          call x Unchecked.defaultof<Foldable>
 
       static member inline Loop (f, acc, xs) = Seq.loop f acc xs
+      static member inline Loop (f, acc, xs) = VSeq'.loop f acc xs
       static member inline Loop (f, acc, xs) = List.loop f acc xs
       static member inline Loop (f, acc, xs) = Array.loop f acc xs
 #if !FABLE_COMPILER
@@ -1483,6 +2039,24 @@ module Typeclasses =
             acc', Option.isSome acc'
          Foldable.InvokeLoop g (Some acc) x
 
+      static member inline FoldWhile (f, acc, x, _ : Priority0) =
+         let g acc x =
+            let acc' = f (VOption.get acc) x
+            acc', VOption.isSome acc'
+         Foldable.InvokeLoop g (ValueSome acc) x
+
+      static member inline FoldWhile (f, acc, x, _ : Priority0) =
+         let g acc x =
+            let acc' = f (Choice.get acc) x
+            acc', Choice.isChoice1Of2 acc'
+         Foldable.InvokeLoop g (Choice1Of2 acc) x
+
+      static member inline FoldWhile (f, acc, x, _ : Priority0) =
+         let g acc x =
+            let acc' = f (Result.get acc) x
+            acc', Result.isOk acc'
+         Foldable.InvokeLoop g (Ok acc) x
+
       static member inline InvokeFoldWhile (f : ^a -> _ -> ^a option) (acc : ^a) x =
          let inline call (x : ^b) (w : ^w) =
             ((^b or ^w) : (static member FoldWhile : _ * _ * _ * _ -> _) f, acc, x, w)
@@ -1493,6 +2067,24 @@ module Typeclasses =
             let acc' = f x (Option.get acc)
             acc', Option.isSome acc'
          Foldable.InvokeLoopBack g x (Some acc)
+
+      static member inline FoldBackWhile (f, x, acc, _ : Priority0) =
+         let g x acc =
+            let acc' = f x (VOption.get acc)
+            acc', VOption.isSome acc'
+         Foldable.InvokeLoopBack g x (ValueSome acc)
+
+      static member inline FoldBackWhile (f, x, acc, _ : Priority0) =
+         let g x acc =
+            let acc' = f x (Choice.get acc)
+            acc', Choice.isChoice1Of2 acc'
+         Foldable.InvokeLoopBack g x (Choice1Of2 acc)
+
+      static member inline FoldBackWhile (f, x, acc, _ : Priority0) =
+         let g x acc =
+            let acc' = f x (Result.get acc)
+            acc', Result.isOk acc'
+         Foldable.InvokeLoopBack g x (Ok acc)
 
       static member inline InvokeFoldBackWhile (f : _ -> ^a -> ^a option) x (acc : ^a) =
          let inline call (x : ^b) (w : ^w) =
@@ -1507,6 +2099,7 @@ module Typeclasses =
       inherit Priority0
 
       static member inline Length (xs, _ : Priority1) = Seq.length xs
+      static member inline Length (xs, _ : Length)    = VSeq'.length xs
       static member inline Length (xs, _ : Length)    = List.length xs
       static member inline Length (xs, _ : Length)    = Array.length xs
 #if !FABLE_COMPILER
@@ -1578,6 +2171,7 @@ module Typeclasses =
       inherit Priority0
 
       static member inline Head (xs, _ : Priority1) = Seq.head xs
+      static member inline Head (xs, _ : Head)      = VSeq'.head xs
       static member inline Head (xs, _ : Head)      = List.head xs
       static member inline Head (xs, _ : Head)      = Array.head xs
 #if !FABLE_COMPILER
@@ -1600,20 +2194,21 @@ module Typeclasses =
          let inline call (x : ^a) (w : ^w) = ((^a or ^w) : (static member Head : _ * _ -> _) x, w)
          call x Unchecked.defaultof<Head>
 
-      static member inline TryHead (xs, _ : Head) = Seq.tryHead xs
-      static member inline TryHead (xs, _ : Head) = List.tryHead xs
-      static member inline TryHead (xs, _ : Head) = Array.tryHead xs
+      static member inline TryHead (xs, _ : Priority1) = Seq.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = VSeq'.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = List.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = Array.tryHead xs
 #if !FABLE_COMPILER
-      static member inline TryHead (xs, _ : Head) = Vec.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = Vec.tryHead xs
 #endif
-      static member inline TryHead (xs, _ : Head) = MVec.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = MVec.tryHead xs
 #if !FABLE_COMPILER
-      static member inline TryHead (xs, _ : Head) = Span.tryHead xs
-      static member inline TryHead (xs, _ : Head) = MSpan.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = Span.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = MSpan.tryHead xs
 #endif
-      static member inline TryHead (xs, _ : Head) = Set.tryHead xs
-      static member inline Tryhead (xs, _ : Head) = Map.tryHead xs
-      static member inline TryHead (xs, _ : Head) = String.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = Set.tryHead xs
+      static member inline Tryhead (xs, _ : Head)      = Map.tryHead xs
+      static member inline TryHead (xs, _ : Head)      = String.tryHead xs
 
       static member inline TryHead (xs, _ : Priority0) =
          try Some (Item.InvokeItem 0 xs) with _ -> None
@@ -1630,11 +2225,14 @@ module Typeclasses =
    [<Fable.Core.Erase>]
 #endif
    type Tail =
-      static member inline Tail (xs, _ : Tail) = Seq.tail xs
-      static member inline Tail (xs, _ : Tail) = List.tail xs
+      inherit Priority0
+
+      static member inline Tail (xs, _ : Priority0) = Seq.tail xs
+      static member inline Tail (xs, _ : Tail)      = VSeq'.tail xs
+      static member inline Tail (xs, _ : Tail)      = List.tail xs
 #if !FABLE_COMPILER
-      static member inline Tail (xs, _ : Tail) = Span.tail xs
-      static member inline Tail (xs, _ : Tail) = MSpan.tail xs
+      static member inline Tail (xs, _ : Tail)      = Span.tail xs
+      static member inline Tail (xs, _ : Tail)      = MSpan.tail xs
 #endif
 
       static member inline Invoke x =
@@ -1680,6 +2278,20 @@ module Typeclasses =
                   ys)))
          ys
 
+      static member inline Traverse (f, xs) =
+         let mutable ys = Applicative.InvokeWrap (MVec ())
+         xs |> Seq.iter (fun x ->
+            ys <- ys |> Monad.InvokeBind (fun ys ->
+               x |> f |> Functor.InvokeMap (fun x -> MVec.add x ys)))
+         ys
+
+      static member inline Traverse (f, xs) =
+         let mutable ys = Applicative.InvokeWrap (MVec ())
+         xs |> VSeq'.iter (fun x ->
+            ys <- ys |> Monad.InvokeBind (fun ys ->
+               x |> f |> Functor.InvokeMap (fun x -> MVec.add x ys)))
+         ys
+
 #if !FABLE_COMPILER
       static member inline Traverse (f, xs) =
          let inline g acc x = acc |> Monad.InvokeBind (fun acc ->
@@ -1690,7 +2302,7 @@ module Typeclasses =
       static member inline Traverse (f, xs) =
          let inline g acc x = acc |> Monad.InvokeBind (fun acc ->
             x |> f |> Functor.InvokeMap (fun x -> MVec.add x acc))
-         MVec.fold g (Applicative.InvokeWrap MVec.empty) xs
+         MVec.fold g (Applicative.InvokeWrap (MVec (MVec.length xs))) xs
 
       static member inline InvokeTraverse ([<InlineIfLambda>] f : _ -> _) x =
          let inline call (x : ^a) (_ : ^w) =
@@ -1703,7 +2315,7 @@ module Typeclasses =
 
       static member inline Traversev (f, xs) =
          let inline g xs x = Validation.InvokeApplyv (Functor.InvokeMap MVec.add (f x)) xs
-         Functor.InvokeMap MVec.toArray (Array.fold g (Applicative.InvokeWrap MVec.empty) xs)
+         Functor.InvokeMap MVec.toArray (Array.fold g (Applicative.InvokeWrap (MVec ())) xs)
 
 #if !FABLE_COMPILER
       static member inline Traversev (f, xs) =
@@ -1713,13 +2325,40 @@ module Typeclasses =
 
       static member inline Traversev (f, xs) =
          let inline g xs x = Validation.InvokeApplyv (Functor.InvokeMap MVec.add (f x)) xs
-         MVec.fold g (Applicative.InvokeWrap MVec.empty) xs
+         MVec.fold g (Applicative.InvokeWrap (MVec ())) xs
 
       static member inline InvokeTraversev ([<InlineIfLambda>] f : _ -> _) x =
          let inline call (x : ^a) (_ : ^w) =
             ((^a or ^w) : (static member Traversev : _ * _ -> _) f, x)
          call x Unchecked.defaultof<Traversable>
 #warnon 64
+
+module VSeq =
+   let unfold    = VSeq'.unfold
+   let ascending = VSeq'.ascending
+
+   let inline take n xs      = VSeq'.take n (Typeclasses.ToVSeq.Invoke xs)
+   let inline takeWhile f xs = VSeq'.takeWhile f (Typeclasses.ToVSeq.Invoke xs)
+   let inline skip n xs      = VSeq'.skip n (Typeclasses.ToVSeq.Invoke xs)
+   let inline skipWhile f xs = VSeq'.skipWhile f (Typeclasses.ToVSeq.Invoke xs)
+
+   let inline map f xs   = VSeq'.map f (Typeclasses.ToVSeq.Invoke xs)
+   let inline zip xs ys  = VSeq'.zip (Typeclasses.ToVSeq.Invoke xs) (Typeclasses.ToVSeq.Invoke ys)
+   let inline indexed xs = VSeq'.indexed (Typeclasses.ToVSeq.Invoke xs)
+
+   let inline filter f xs = VSeq'.filter f (Typeclasses.ToVSeq.Invoke xs)
+   let inline choose f xs = VSeq'.choose f (Typeclasses.ToVSeq.Invoke xs)
+
+   let inline length xs     = VSeq'.length (Typeclasses.ToVSeq.Invoke xs)
+   let inline iter f xs     = VSeq'.iter f (Typeclasses.ToVSeq.Invoke xs)
+   let inline fold f acc xs = VSeq'.fold f acc (Typeclasses.ToVSeq.Invoke xs)
+   let inline loop f acc xs = VSeq'.loop f acc (Typeclasses.ToVSeq.Invoke xs)
+   let inline forall p xs   = VSeq'.forall p (Typeclasses.ToVSeq.Invoke xs)
+   let inline exists p xs   = VSeq'.exists p (Typeclasses.ToVSeq.Invoke xs)
+
+   let inline head xs    = VSeq'.head (Typeclasses.ToVSeq.Invoke xs)
+   let inline tryHead xs = VSeq'.head (Typeclasses.ToVSeq.Invoke xs)
+   let inline tail xs    = VSeq'.head (Typeclasses.ToVSeq.Invoke xs)
 
 module Builders =
    open Typeclasses
@@ -1834,6 +2473,8 @@ module Operators =
    let inline (++) x y    = Monoid.InvokeCombine x y
    let inline (<|>) x y   = Monoid.InvokeCombine x y
 
+   let inline vseq x = ToVSeq.Invoke x
+
    let inline map ([<InlineIfLambda>] f) x   = Functor.InvokeMap f x
    let inline iter ([<InlineIfLambda>] f) x  = Functor.InvokeIter f x
    let inline (|>>) x ([<InlineIfLambda>] f) = Functor.InvokeMap f x
@@ -1879,7 +2520,8 @@ module Operators =
    let inline orElseError e x = OrError.InvokeOrElseError e x
    let inline (||!) x e       = OrError.InvokeOrElseError e x
 
-   let inline filter ([<InlineIfLambda>] f) x = Filter.Invoke f x
+   let inline filter ([<InlineIfLambda>] f) x = Filter.InvokeFilter f x
+   let inline choose ([<InlineIfLambda>] f) x = Filter.InvokeChoose f x
 
    let inline fold ([<InlineIfLambda>] f) acc x = Foldable.InvokeFold f acc x
    let inline foldBack f x acc                  = Foldable.InvokeFoldBack f acc x
